@@ -1,30 +1,42 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="pt-br">
   <head>
-    <title>Transfer Learning - TensorFlow.js</title>
+    <title>Mini Teachable Machine - TensorFlow.js</title>
     <meta charset="utf-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- Import the webpage's stylesheet -->
-    <link rel="stylesheet" href="/style.css">
+    <style>
+      body { font-family: Arial, sans-serif; padding: 20px; }
+      video { border: 2px solid #444; border-radius: 10px; margin-top: 10px; }
+      button { margin: 5px; padding: 8px 12px; }
+      input { margin: 5px; padding: 5px; }
+      .class-input { display: block; margin-bottom: 10px; }
+      .removed { display: none; }
+      #buttonsContainer { margin-top: 15px; }
+      #status { font-weight: bold; margin-top: 15px; }
+    </style>
   </head>  
   <body>
-    <h1>Make your own "Teachable Machine" using Transfer Learning with MobileNet v3 in TensorFlow.js using saved graph model from TFHub.</h1>
-    
-    <p id="status">Awaiting TF.js load</p>
-    
-    <video id="webcam" autoplay muted></video>
-    
-    <button id="enableCam">Enable Webcam</button>
-    <button class="dataCollector" data-1hot="0" data-name="Class 1">Gather Class 1 Data</button>
-    <button class="dataCollector" data-1hot="1" data-name="Class 2">Gather Class 2 Data</button>
-    <button id="train">Train &amp; Predict!</button>
-    <button id="reset">Reset</button>
+    <h1>Mini Teachable Machine com TensorFlow.js</h1>
 
-    <!-- Import TensorFlow.js library -->
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0/dist/tf.min.js" type="text/javascript"></script>
+    <label for="numClasses">Quantas classes deseja criar?</label>
+    <input type="number" id="numClasses" min="2" max="10" value="3">
+    <button id="generateInputs">Gerar Campos</button>
 
-    <!-- Import the page's JavaScript to do some stuff -->
-    <script type="module" src="/script.js"></script>
+    <div id="classInputsContainer"></div>
+    <button id="setClasses" disabled>Definir Classes</button>
+
+    <video id="webcam" autoplay muted width="400" height="300"></video><br>
+    <button id="enableCam">Ativar Webcam</button>
+
+    <div id="buttonsContainer"></div>
+
+    <button id="train">Treinar e Prever!</button>
+    <button id="reset">Resetar</button>
+
+    <p id="status">Aguardando carregamento do TensorFlow.js...</p>
+
+    <!-- TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0/dist/tf.min.js"></script>
+    <script type="module" src="script.js"></script>
   </body>
 </html>

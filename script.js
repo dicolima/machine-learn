@@ -3,17 +3,82 @@ const VIDEO = document.getElementById('webcam');
 const ENABLE_CAM_BUTTON = document.getElementById('enableCam');
 const RESET_BUTTON = document.getElementById('reset');
 const TRAIN_BUTTON = document.getElementById('train');
+const SET_CLASSES_BUTTON = document.getElementById('setClasses');
+const GENERATE_INPUTS_BUTTON = document.getElementById('generateInputs');
+const CLASS_INPUTS_CONTAINER = document.getElementById('classInputsContainer');
+const BUTTONS_CONTAINER = document.getElementById('buttonsContainer');
 const MOBILE_NET_INPUT_WIDTH = 224;
 const MOBILE_NET_INPUT_HEIGHT = 224;
 const STOP_DATA_GATHER = -1;
-const CLASS_NAMES = [];
 
+let CLASS_NAMES = [];
+let dataCollectorButtons = [];
+let gatherDataState = STOP_DATA_GATHER;
+let videoPlaying = false;
+let trainingDataInputs = [];
+let trainingDataOutputs = [];
+let examplesCount = [];
+let predict = false;
+let mobilenet;
+let model;
 
-//Adicionar listeners de eventos principais
+// Gera os campos para os nomes das classes
+GENERATE_INPUTS_BUTTON.addEventListener('click', () => {
+  CLASS_INPUTS_CONTAINER.innerHTML = '';
+  BUTTONS_CONTAINER.innerHTML = '';
+  CLASS_NAMES = [];
+  dataCollectorButtons = [];
+
+  const numClasses = parseInt(document.getElementById('numClasses').value);
+  if (numClasses < 2 || numClasses > 10) {
+    alert('Escolha entre 2 e 10 classes.');
+    return;
+  }
+
+  for (let i = 0; i < numClasses; i++) {
+    const div = document.createElement('div');
+    div.classList.add('class-input');
+    div.innerHTML = `
+      <label>Nome da Classe ${i + 1}: </label>
+      <input type="text" id="className${i}" placeholder="Ex: Objeto ${i + 1}">
+    `;
+    CLASS_INPUTS_CONTAINER.appendChild(div);
+  }
+
+  SET_CLASSES_BUTTON.disabled = false;
+});
+
+// Define os nomes das classes e cria botões de coleta
+SET_CLASSES_BUTTON.addEventListener('click', () => {
+  CLASS_NAMES = [];
+  BUTTONS_CONTAINER.innerHTML = '';
+  dataCollectorButtons = [];
+
+  const inputs = document.querySelectorAll('#classInputsContainer input');
+  for (let i = 0; i < inputs.length; i++) {
+    const name = inputs[i].value.trim() || `Classe ${i + 1}`;
+    CLASS_NAMES.push(name);
+  }
+
+  // Criar botões de coleta
+  CLASS_NAMES.forEach((name, index) => {
+    const btn = document.createElement('button');
+    btn.innerText = `Coletar dados de ${name}`;
+    btn.classList.add('dataCollector');
+    btn.dataset.onehot = index;
+    btn.addEventListener('mousedown', gatherDataForClass);
+    btn.addEventListener('mouseup', gatherDataForClass);
+    BUTTONS_CONTAINER.appendChild(btn);
+    dataCollectorButtons.push(btn);
+  });
+
+  STATUS.innerText = `Classes definidas: ${CLASS_NAMES.join(', ')}. Agora colete os dados!`;
+});
+
+// Ativa a webcam
 ENABLE_CAM_BUTTON.addEventListener('click', enableCam);
 TRAIN_BUTTON.addEventListener('click', trainAndPredict);
 RESET_BUTTON.addEventListener('click', reset);
-
 
 function hasGetUserMedia() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -21,172 +86,121 @@ function hasGetUserMedia() {
 
 function enableCam() {
   if (hasGetUserMedia()) {
-    // getUsermedia parameters.
-    const constraints = {
-      video: true,
-      width: 640, 
-      height: 480 
-    };
-
-    // Activate the webcam stream.
-    navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+    const constraints = { video: true, width: 640, height: 480 };
+    navigator.mediaDevices.getUserMedia(constraints).then(stream => {
       VIDEO.srcObject = stream;
-      VIDEO.addEventListener('loadeddata', function() {
+      VIDEO.addEventListener('loadeddata', () => {
         videoPlaying = true;
         ENABLE_CAM_BUTTON.classList.add('removed');
       });
     });
   } else {
-    console.warn('getUserMedia() is not supported by your browser');
+    console.warn('getUserMedia() não suportado neste navegador.');
   }
 }
 
+// Carrega o MobileNet
+async function loadMobileNetFeatureModel() {
+  const URL = 'https://tfhub.dev/google/tfjs-model/imagenet/mobilenet_v3_small_100_224/feature_vector/5/default/1';
+  mobilenet = await tf.loadGraphModel(URL, { fromTFHub: true });
+  STATUS.innerText = 'MobileNet v3 carregado com sucesso!';
 
-async function trainAndPredict() {
-  predict = false;
-  tf.util.shuffleCombo(trainingDataInputs, trainingDataOutputs);
-  let outputsAsTensor = tf.tensor1d(trainingDataOutputs, 'int32');
-  let oneHotOutputs = tf.oneHot(outputsAsTensor, CLASS_NAMES.length);
-  let inputsAsTensor = tf.stack(trainingDataInputs);
-  
-  await model.fit(inputsAsTensor, oneHotOutputs, {shuffle: true, batchSize: 5, epochs: 10, 
-      callbacks: {onEpochEnd: logProgress} });
-  
-  outputsAsTensor.dispose();
-  oneHotOutputs.dispose();
-  inputsAsTensor.dispose();
-  predict = true;
-  predictLoop();
+  tf.tidy(() => {
+    mobilenet.predict(tf.zeros([1, MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH, 3]));
+  });
 }
+loadMobileNetFeatureModel();
 
-function logProgress(epoch, logs) {
-  console.log('Data for epoch ' + epoch, logs);
-}
-
-function predictLoop() {
-  if (predict) {
-    tf.tidy(function() {
-      let videoFrameAsTensor = tf.browser.fromPixels(VIDEO).div(255);
-      let resizedTensorFrame = tf.image.resizeBilinear(videoFrameAsTensor,[MOBILE_NET_INPUT_HEIGHT, 
-          MOBILE_NET_INPUT_WIDTH], true);
-
-      let imageFeatures = mobilenet.predict(resizedTensorFrame.expandDims());
-      let prediction = model.predict(imageFeatures).squeeze();
-      let highestIndex = prediction.argMax().arraySync();
-      let predictionArray = prediction.arraySync();
-
-      STATUS.innerText = 'Prediction: ' + CLASS_NAMES[highestIndex] + ' with ' + Math.floor(predictionArray[highestIndex] * 100) + '% confidence';
-    });
-
-    window.requestAnimationFrame(predictLoop);
-  }
-}
-
-
-/**
- * Purge data and start over. Note this does not dispose of the loaded 
- * MobileNet model and MLP head tensors as you will need to reuse 
- * them to train a new model.
- **/
-function reset() {
-  predict = false;
-  examplesCount.length = 0;
-  for (let i = 0; i < trainingDataInputs.length; i++) {
-    trainingDataInputs[i].dispose();
-  }
-  trainingDataInputs.length = 0;
-  trainingDataOutputs.length = 0;
-  STATUS.innerText = 'No data collected';
-  
-  console.log('Tensors in memory: ' + tf.memory().numTensors);
-}
-
-
-let dataCollectorButtons = document.querySelectorAll('button.dataCollector');
-for (let i = 0; i < dataCollectorButtons.length; i++) {
-  dataCollectorButtons[i].addEventListener('mousedown', gatherDataForClass);
-  dataCollectorButtons[i].addEventListener('mouseup', gatherDataForClass);
-  // Populate the human readable names for classes.
-  CLASS_NAMES.push(dataCollectorButtons[i].getAttribute('data-name'));
-}
-
-/**
- * Handle Data Gather for button mouseup/mousedown.
- **/
+// Loop de coleta de dados
 function gatherDataForClass() {
-  let classNumber = parseInt(this.getAttribute('data-1hot'));
+  const classNumber = parseInt(this.dataset.onehot);
   gatherDataState = (gatherDataState === STOP_DATA_GATHER) ? classNumber : STOP_DATA_GATHER;
   dataGatherLoop();
 }
 
-let mobilenet = undefined;
-let gatherDataState = STOP_DATA_GATHER;
-let videoPlaying = false;
-let trainingDataInputs = [];
-let trainingDataOutputs = [];
-let examplesCount = [];
-let predict = false;
-
-/**
- * Loads the MobileNet model and warms it up so ready for use.
- **/
-async function loadMobileNetFeatureModel() {
-  const URL = 
-    'https://tfhub.dev/google/tfjs-model/imagenet/mobilenet_v3_small_100_224/feature_vector/5/default/1';
-  
-  mobilenet = await tf.loadGraphModel(URL, {fromTFHub: true});
-  STATUS.innerText = 'MobileNet v3 loaded successfully!';
-  
-  // Warm up the model by passing zeros through it once.
-  tf.tidy(function () {
-    let answer = mobilenet.predict(tf.zeros([1, MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH, 3]));
-    console.log(answer.shape);
-  });
-}
-
-// Call the function immediately to start loading.
-loadMobileNetFeatureModel();
-
-let model = tf.sequential();
-model.add(tf.layers.dense({inputShape: [1024], units: 128, activation: 'relu'}));
-model.add(tf.layers.dense({units: CLASS_NAMES.length, activation: 'softmax'}));
-
-model.summary();
-
-// Compile the model with the defined optimizer and specify a loss function to use.
-model.compile({
-  // Adam changes the learning rate over time which is useful.
-  optimizer: 'adam',
-  // Use the correct loss function. If 2 classes of data, must use binaryCrossentropy.
-  // Else categoricalCrossentropy is used if more than 2 classes.
-  loss: (CLASS_NAMES.length === 2) ? 'binaryCrossentropy': 'categoricalCrossentropy', 
-  // As this is a classification problem you can record accuracy in the logs too!
-  metrics: ['accuracy']  
-});
-
 function dataGatherLoop() {
   if (videoPlaying && gatherDataState !== STOP_DATA_GATHER) {
-    let imageFeatures = tf.tidy(function() {
-      let videoFrameAsTensor = tf.browser.fromPixels(VIDEO);
-      let resizedTensorFrame = tf.image.resizeBilinear(videoFrameAsTensor, [MOBILE_NET_INPUT_HEIGHT, 
-          MOBILE_NET_INPUT_WIDTH], true);
-      let normalizedTensorFrame = resizedTensorFrame.div(255);
-      return mobilenet.predict(normalizedTensorFrame.expandDims()).squeeze();
+    let imageFeatures = tf.tidy(() => {
+      let frame = tf.browser.fromPixels(VIDEO);
+      let resized = tf.image.resizeBilinear(frame, [MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH], true);
+      return mobilenet.predict(resized.div(255).expandDims()).squeeze();
     });
 
     trainingDataInputs.push(imageFeatures);
     trainingDataOutputs.push(gatherDataState);
-    
-    // Intialize array index element if currently undefined.
-    if (examplesCount[gatherDataState] === undefined) {
-      examplesCount[gatherDataState] = 0;
-    }
+
+    if (!examplesCount[gatherDataState]) examplesCount[gatherDataState] = 0;
     examplesCount[gatherDataState]++;
 
-    STATUS.innerText = '';
-    for (let n = 0; n < CLASS_NAMES.length; n++) {
-      STATUS.innerText += CLASS_NAMES[n] + ' data count: ' + examplesCount[n] + '. ';
-    }
+    STATUS.innerText = CLASS_NAMES.map((name, i) =>
+      `${name}: ${examplesCount[i] || 0} imagens`
+    ).join(' | ');
+
     window.requestAnimationFrame(dataGatherLoop);
   }
+}
+
+// Treina e faz predições
+async function trainAndPredict() {
+  if (CLASS_NAMES.length < 2) {
+    alert('Defina pelo menos duas classes antes de treinar.');
+    return;
+  }
+
+  model = tf.sequential();
+  model.add(tf.layers.dense({ inputShape: [1024], units: 128, activation: 'relu' }));
+  model.add(tf.layers.dense({ units: CLASS_NAMES.length, activation: 'softmax' }));
+  model.compile({
+    optimizer: 'adam',
+    loss: (CLASS_NAMES.length === 2) ? 'binaryCrossentropy' : 'categoricalCrossentropy',
+    metrics: ['accuracy']
+  });
+
+  tf.util.shuffleCombo(trainingDataInputs, trainingDataOutputs);
+  const outputsTensor = tf.tensor1d(trainingDataOutputs, 'int32');
+  const oneHotOutputs = tf.oneHot(outputsTensor, CLASS_NAMES.length);
+  const inputsTensor = tf.stack(trainingDataInputs);
+
+  await model.fit(inputsTensor, oneHotOutputs, {
+    shuffle: true,
+    batchSize: 5,
+    epochs: 10,
+    callbacks: { onEpochEnd: (epoch, logs) => console.log(`Época ${epoch}:`, logs) }
+  });
+
+  outputsTensor.dispose();
+  oneHotOutputs.dispose();
+  inputsTensor.dispose();
+
+  STATUS.innerText = 'Treinamento concluído! Fazendo predições...';
+  predict = true;
+  predictLoop();
+}
+
+// Loop de predição
+function predictLoop() {
+  if (predict) {
+    tf.tidy(() => {
+      let frame = tf.browser.fromPixels(VIDEO).div(255);
+      let resized = tf.image.resizeBilinear(frame, [MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH], true);
+      let features = mobilenet.predict(resized.expandDims());
+      let prediction = model.predict(features).squeeze();
+      let index = prediction.argMax().arraySync();
+      let probs = prediction.arraySync();
+
+      STATUS.innerText = `Predição: ${CLASS_NAMES[index]} (${(probs[index] * 100).toFixed(1)}% de confiança)`;
+    });
+    window.requestAnimationFrame(predictLoop);
+  }
+}
+
+// Resetar
+function reset() {
+  predict = false;
+  examplesCount = [];
+  trainingDataInputs.forEach(t => t.dispose());
+  trainingDataInputs = [];
+  trainingDataOutputs = [];
+  STATUS.innerText = 'Dados limpos. Pronto para novo treinamento.';
+  console.log('Tensores na memória:', tf.memory().numTensors);
 }
