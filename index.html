@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reconhecimento com Saudação (TF.js + MobileNet)</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 18px; background:#f5f7fb; color:#111; }
+    h1 { margin-bottom: 6px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+    video { border-radius:8px; border:2px solid #333; width:400px; height:300px; object-fit:cover; background:#222; }
+    button { padding:8px 12px; border-radius:6px; border:none; background:#1976d2; color:#fff; cursor:pointer; }
+    button.secondary { background:#555; }
+    button:disabled { background:#bbb; cursor:not-allowed; }
+    input[type="text"], input[type="number"] { padding:6px 8px; border-radius:6px; border:1px solid #ccc; }
+    .class-list { margin-top: 8px; display:flex; flex-direction:column; gap:8px; max-width:640px; }
+    .controls { margin-top: 12px; }
+    #buttonsContainer { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    #status { margin-top:14px; font-weight:600; }
+    #progressContainer { width:100%; background:#e6e6e6; border-radius:8px; height:28px; overflow:hidden; display:none; margin-top:12px; }
+    #progressBar { height:100%; width:0%; display:flex; align-items:center; justify-content:center; font-weight:700; color:#fff; background: linear-gradient(90deg,#42a5f5,#1e88e5); transition: width .25s ease; }
+    .small { font-size:0.9rem; color:#444; }
+    .example-count { margin-left:8px; font-size:0.85rem; color:#333; }
+  </style>
+</head>
+<body>
+
+  <h1>Reconhecimento de Pessoas + Saudação (TF.js)</h1>
+  <p class="small">Crie N classes (pessoas), colete imagens por pessoa, treine e a página falará "Olá <nome>, seja bem-vindo!" quando reconhecer alguém.</p>
+
+  <div class="row">
+    <label>Quantas classes (2–10):</label>
+    <input id="numClasses" type="number" min="2" max="10" value="3" />
+    <button id="generateInputs">Gerar Campos</button>
+    <button id="enableCam">Ativar Webcam</button>
+  </div>
+
+  <div id="classInputsContainer" class="class-list"></div>
+
+  <div class="controls">
+    <button id="setClasses" class="secondary" disabled>Definir Classes</button>
+    <button id="train" disabled>Treinar</button>
+    <button id="reset" class="secondary">Resetar Dados</button>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <video id="webcam" autoplay playsinline muted></video>
+    <div style="flex:1; min-width:260px;">
+      <div id="buttonsContainer"></div>
+      <div id="exampleCounts" class="small"></div>
+      <div id="progressContainer"><div id="progressBar">0%</div></div>
+      <p id="status">Status: aguardando ações...</p>
+    </div>
+  </div>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0/dist/tf.min.js"></script>
+
+  <script>
+  // ---------------------------
+  // Configurações
+  // ---------------------------
+  const MOBILE_NET_INPUT_WIDTH = 224;
+  const MOBILE_NET_INPUT_HEIGHT = 224;
+  const MIN_EXAMPLES_PER_CLASS = 10;   // recomendado mínimo por classe antes de treinar
+  const TRAIN_EPOCHS = 12;             // número de épocas para treinar
+  const BATCH_SIZE = 8;
+  const GREETING_CONFIDENCE_THRESHOLD = 0.60; // só falar se confiança >= 0.60
+  const GREETING_COOLDOWN_MS = 15000; // 15 segundos até poder saudar a mesma pessoa novamente
+
+  // ---------------------------
+  // Elementos DOM
+  // ---------------------------
+  const numClassesEl = document.getElementById('numClasses');
+  const generateInputsBtn = document.getElementById('generateInputs');
+  const classInputsContainer = document.getElementById('classInputsContainer');
+  const setClassesBtn = document.getElementById('setClasses');
+  const enableCamBtn = document.getElementById('enableCam');
+  const trainBtn = document.getElementById('train');
+  const resetBtn = document.getElementById('reset');
+  const webcamEl = document.getElementById('webcam');
+  const buttonsContainer = document.getElementById('buttonsContainer');
+  const statusEl = document.getElementById('status');
+  const progressContainer = document.getElementById('progressContainer');
+  const progressBar = document.getElementById('progressBar');
+  const exampleCountsEl = document.getElementById('exampleCounts');
+
+  // ---------------------------
+  // Estado
+  // ---------------------------
+  let CLASS_NAMES = [];
+  let dataCollectorButtons = [];
+  let mobilenet;            // feature extractor (graph model from TFHub)
+  let model;                // cabeça classificadora (tf.Sequential)
+  let gatherDataState = -1; // -1 => não coletando, >=0 => index da classe sendo coletada
+  let videoPlaying = false;
+  let trainingDataInputs = [];   // array de tensors (features)
+  let trainingDataOutputs = [];  // array de int labels
+  let examplesCount = [];        // contagem por classe
+  let predict = false;
+  let lastGreetTimestamps = {};  // { classIndex: timestamp_ms }
+  let speechAllowed = ('speechSynthesis' in window);
+
+  // ---------------------------
+  // Geração de campos dinâmicos
+  // ---------------------------
+  generateInputsBtn.addEventListener('click', () => {
+    const n = Math.max(2, Math.min(10, parseInt(numClassesEl.value) || 3));
+    classInputsContainer.innerHTML = '';
+    CLASS_NAMES = [];
+    for (let i = 0; i < n; i++) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = `
+        <label>Nome da Classe ${i+1}: </label>
+        <input id="className_${i}" type="text" placeholder="Nome da pessoa ${i+1}" />
+        <span class="example-count" id="count_${i}">0</span>
+      `;
+      classInputsContainer.appendChild(wrapper);
+    }
+    setClassesBtn.disabled = false;
+    statusEl.innerText = 'Status: preencha os nomes e clique em "Definir Classes".';
+  });
+
+  // ---------------------------
+  // Definir classes e criar botões de coleta
+  // ---------------------------
+  setClassesBtn.addEventListener('click', () => {
+    // ler nomes
+    const inputs = classInputsContainer.querySelectorAll('input');
+    CLASS_NAMES = [];
+    for (let i = 0; i < inputs.length; i++) {
+      const name = inputs[i].value.trim() || `Classe ${i+1}`;
+      CLASS_NAMES.push(name);
+      document.getElementById(`count_${i}`).innerText = '0';
+    }
+
+    // criar botões de coleta
+    buttonsContainer.innerHTML = '';
+    dataCollectorButtons = [];
+    for (let i = 0; i < CLASS_NAMES.length; i++) {
+      const btn = document.createElement('button');
+      btn.innerText = `Coletar: ${CLASS_NAMES[i]}`;
+      btn.dataset.classIndex = i;
+      // interações mouse + touch
+      btn.addEventListener('mousedown', startCollectingOnButton);
+      btn.addEventListener('mouseup', stopCollectingOnButton);
+      btn.addEventListener('mouseleave', stopCollectingOnButton);
+      btn.addEventListener('touchstart', (e) => { e.preventDefault(); startCollectingOnButton.call(btn, e); });
+      btn.addEventListener('touchend', (e) => { e.preventDefault(); stopCollectingOnButton.call(btn, e); });
+      buttonsContainer.appendChild(btn);
+      dataCollectorButtons.push(btn);
+    }
+
+    trainBtn.disabled = false;
+    statusEl.innerText = `Status: classes definidas: ${CLASS_NAMES.join(', ')}. Ative a webcam e comece a coletar imagens.`;
+  });
+
+  // ---------------------------
+  // Webcam
+  // ---------------------------
+  enableCamBtn.addEventListener('click', async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      webcamEl.srcObject = stream;
+      await new Promise(resolve => webcamEl.onloadeddata = resolve);
+      videoPlaying = true;
+      enableCamBtn.disabled = true;
+      statusEl.innerText = 'Status: webcam ativa.';
+      // carrega modelo MobileNet se ainda não carregado
+      if (!mobilenet) {
+        await loadMobileNetFeatureModel();
+      }
+    } catch (err) {
+      console.error('Erro ao ativar webcam:', err);
+      statusEl.innerText = 'Erro: não foi possível ativar a webcam.';
+    }
+  });
+
+  // ---------------------------
+  // Load MobileNet feature vector (TFHub)
+  // ---------------------------
+  async function loadMobileNetFeatureModel() {
+    const URL = 'https://tfhub.dev/google/tfjs-model/imagenet/mobilenet_v3_small_100_224/feature_vector/5/default/1';
+    statusEl.innerText = 'Status: carregando MobileNet v3...';
+    mobilenet = await tf.loadGraphModel(URL, { fromTFHub: true });
+    // warmup
+    tf.tidy(() => {
+      mobilenet.predict(tf.zeros([1, MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH, 3]));
+    });
+    statusEl.innerText = 'Status: MobileNet carregado. Pronto para coleta.';
+  }
+
+  // ---------------------------
+  // Coleta de dados — start/stop
+  // ---------------------------
+  function startCollectingOnButton(ev) {
+    const idx = parseInt(this.dataset.classIndex);
+    gatherDataState = idx;
+    // visual feedback
+    this.style.background = '#d32f2f';
+    this.style.color = '#fff';
+    dataGatherLoop();
+  }
+  function stopCollectingOnButton(ev) {
+    const idx = parseInt(this.dataset.classIndex);
+    // if same index, stop
+    if (gatherDataState === idx) gatherDataState = -1;
+    // restore styles
+    for (const btn of dataCollectorButtons) { btn.style.background = ''; btn.style.color = ''; }
+  }
+
+  // Loop de coleta:
+  function dataGatherLoop() {
+    if (videoPlaying && gatherDataState !== -1) {
+      // extrair features com mobilenet dentro de tidy
+      const imageFeatures = tf.tidy(() => {
+        const frame = tf.browser.fromPixels(webcamEl);
+        const resized = tf.image.resizeBilinear(frame, [MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH], true);
+        const normalized = resized.div(255);
+        const batched = normalized.expandDims(); // [1, H, W, 3]
+        const features = mobilenet.predict(batched).squeeze(); // shape [1024]
+        return features.clone(); // clone para manter fora do tidy
+      });
+
+      trainingDataInputs.push(imageFeatures);
+      trainingDataOutputs.push(gatherDataState);
+
+      examplesCount[gatherDataState] = (examplesCount[gatherDataState] || 0) + 1;
+      document.getElementById(`count_${gatherDataState}`).innerText = `${examplesCount[gatherDataState]} imagens`;
+
+      // atualizar resumo
+      exampleCountsEl.innerText = CLASS_NAMES.map((n,i) => `${n}: ${examplesCount[i] || 0}`).join(' | ');
+
+      // continuar enquanto o botão estiver pressionado
+      requestAnimationFrame(dataGatherLoop);
+    }
+  }
+
+  // ---------------------------
+  // Treinar
+  // ---------------------------
+  trainBtn.addEventListener('click', async () => {
+    // checar exemplos mínimos
+    for (let i = 0; i < CLASS_NAMES.length; i++) {
+      if ((examplesCount[i] || 0) < MIN_EXAMPLES_PER_CLASS) {
+        alert(`A classe "${CLASS_NAMES[i]}" precisa de pelo menos ${MIN_EXAMPLES_PER_CLASS} exemplos. Atualmente: ${examplesCount[i] || 0}`);
+        return;
+      }
+    }
+
+    statusEl.innerText = 'Status: preparando dados para treinamento...';
+    // construir modelo (novamente)
+    model = tf.sequential();
+    model.add(tf.layers.dense({ inputShape: [1024], units: 256, activation: 'relu' }));
+    model.add(tf.layers.dropout({ rate: 0.4 }));
+    model.add(tf.layers.dense({ units: CLASS_NAMES.length, activation: 'softmax' }));
+
+    model.compile({
+      optimizer: tf.train.adam(0.0005),
+      loss: (CLASS_NAMES.length === 2) ? 'binaryCrossentropy' : 'categoricalCrossentropy',
+      metrics: ['accuracy']
+    });
+
+    // preparar tensores
+    tf.util.shuffleCombo(trainingDataInputs, trainingDataOutputs);
+
+    const xs = tf.stack(trainingDataInputs); // [N, 1024]
+    const ys = tf.oneHot(tf.tensor1d(trainingDataOutputs, 'int32'), CLASS_NAMES.length);
+
+    // UI: mostrar barra
+    progressContainer.style.display = 'block';
+    progressBar.style.width = '0%';
+    progressBar.innerText = '0%';
+
+    statusEl.innerText = 'Status: treinando...';
+
+    let finalAcc = 0;
+    await model.fit(xs, ys, {
+      epochs: TRAIN_EPOCHS,
+      batchSize: BATCH_SIZE,
+      shuffle: true,
+      callbacks: {
+        onEpochEnd: async (epoch, logs) => {
+          finalAcc = logs.acc || logs.accuracy || 0;
+          const pct = Math.round(((epoch + 1)/TRAIN_EPOCHS) * 100);
+          progressBar.style.width = pct + '%';
+          progressBar.innerText = `${pct}%`;
+          statusEl.innerText = `Treinando: época ${epoch+1}/${TRAIN_EPOCHS} — loss: ${logs.loss.toFixed(4)} — acc: ${((finalAcc)*100).toFixed(1)}%`;
+          await tf.nextFrame();
+        }
+      }
+    });
+
+    progressBar.style.width = '100%';
+    progressBar.innerText = `Concluído — acurácia: ${(finalAcc*100).toFixed(1)}%`;
+
+    // liberar tensores intermediários
+    xs.dispose();
+    ys.dispose();
+
+    statusEl.innerText = 'Treinamento concluído — iniciando predições em tempo real.';
+    predict = true;
+    startPredictLoop();
+  });
+
+  // ---------------------------
+  // Predict loop + saudação por voz
+  // ---------------------------
+  async function startPredictLoop() {
+    if (!model || !mobilenet) return;
+    predict = true;
+
+    async function loop() {
+      if (!predict) return;
+
+      tf.tidy(() => {
+        const frame = tf.browser.fromPixels(webcamEl);
+        const resized = tf.image.resizeBilinear(frame, [MOBILE_NET_INPUT_HEIGHT, MOBILE_NET_INPUT_WIDTH], true);
+        const normalized = resized.div(255);
+        const batched = normalized.expandDims();
+        const features = mobilenet.predict(batched);
+
+        const prediction = model.predict(features).squeeze(); // shape [numClasses]
+        const probs = prediction.arraySync();
+        const maxIndex = prediction.argMax().arraySync();
+        const confidence = probs[maxIndex];
+
+        // atualizar status
+        statusEl.innerText = `Predição: ${CLASS_NAMES[maxIndex]} — ${(confidence*100).toFixed(1)}%`;
+
+        // se acima do limiar, falar (com cooldown)
+        if (confidence >= GREETING_CONFIDENCE_THRESHOLD) {
+          const now = Date.now();
+          const last = lastGreetTimestamps[maxIndex] || 0;
+          if ((now - last) > GREETING_COOLDOWN_MS) {
+            lastGreetTimestamps[maxIndex] = now;
+            speakGreeting(CLASS_NAMES[maxIndex]);
+          }
+        }
+      });
+
+      requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // ---------------------------
+  // Fala (Web Speech API)
+  // ---------------------------
+  function speakGreeting(name) {
+    if (!speechAllowed) {
+      console.warn('SpeechSynthesis não disponível no navegador.');
+      return;
+    }
+    const text = `Olá ${name}, seja bem vindo.`;
+    const ut = new SpeechSynthesisUtterance(text);
+    ut.lang = 'pt-BR';
+    ut.rate = 1;
+    ut.pitch = 1;
+    window.speechSynthesis.cancel(); // cancela enunciados anteriores
+    window.speechSynthesis.speak(ut);
+  }
+
+  // ---------------------------
+  // Reset
+  // ---------------------------
+  resetBtn.addEventListener('click', () => {
+    // parar predições
+    predict = false;
+    // liberar tensores coletados
+    for (let t of trainingDataInputs) {
+      try { t.dispose(); } catch(e){/* noop */ }
+    }
+    trainingDataInputs = [];
+    trainingDataOutputs = [];
+    examplesCount = [];
+    lastGreetTimestamps = {};
+    exampleCountsEl.innerText = '';
+    // limpar UI
+    for (let i = 0; i < CLASS_NAMES.length; i++) {
+      const el = document.getElementById(`count_${i}`);
+      if (el) el.innerText = '0';
+    }
+    progressContainer.style.display = 'none';
+    progressBar.style.width = '0%';
+    progressBar.innerText = '0%';
+    statusEl.innerText = 'Status: dados resetados.';
+  });
+
+  // ---------------------------
+  // Antes de fechar a página - liberar recursos
+  // ---------------------------
+  window.addEventListener('beforeunload', () => {
+    predict = false;
+    if (model) try { model.dispose(); } catch(e){}
+    if (mobilenet) try { mobilenet.dispose(); } catch(e){}
+    trainingDataInputs.forEach(t => { try { t.dispose(); } catch(e){} });
+  });
+
+  </script>
+</body>
+</html>
